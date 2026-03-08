@@ -1,6 +1,7 @@
 #include "gcae.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <fstream>
 #include <iostream>
@@ -709,13 +710,44 @@ static int static_eval(const game_state &gs, char root_player)
 {
     int p = (root_player == 'A') ? 0 : 1;
     int o = 1 - p;
+
     if (game_over_check(gs) && gs.players[p].H > 0)
         return INF;
     if (game_over_check(gs) && gs.players[p].H <= 0)
         return -INF;
-    int score = (int)gs.players[p].H + gs.players[p].A + gs.players[p].D + gs.players[p].S -
-                ((int)gs.players[o].H + gs.players[o].A + gs.players[o].D + gs.players[o].S);
-    return score;
+
+    int dmg_p = std::max(1, gs.players[p].A - gs.players[o].D);
+    int dmg_o = std::max(1, gs.players[o].A - gs.players[p].D);
+
+    int turns_to_kill_o = (gs.players[o].H + dmg_p - 1) / dmg_p;
+    int turns_to_kill_p = (gs.players[p].H + dmg_o - 1) / dmg_o;
+
+    int tempo_score = (turns_to_kill_p - turns_to_kill_o) * 100;
+
+    int stat_score =
+        gs.players[p].H + gs.players[p].A + gs.players[p].D + gs.players[p].S -
+        (gs.players[o].H + gs.players[o].A + gs.players[o].D + gs.players[o].S);
+
+    return tempo_score + stat_score;
+}
+
+/* close_game_eval
+ - Evaluates a position when the game is forced to end due to too many consecutive passes.
+ - The winner is decided by comparing the overall stats of both players.
+ - Returns +INF if the root_player has the advantage, otherwise -INF. */
+static int close_game_eval(const game_state &gs, char root_player){
+    int p = (root_player == 'A') ? 0 : 1;
+    int o = 1 - p;
+
+    int stat_score =
+        gs.players[p].H + gs.players[p].A + gs.players[p].D + gs.players[p].S -
+        (gs.players[o].H + gs.players[o].A + gs.players[o].D + gs.players[o].S);
+
+    if(stat_score > 0){
+        return INF;
+    }
+    return -INF;
+
 }
 
 /* minimax_search
@@ -723,8 +755,12 @@ static int static_eval(const game_state &gs, char root_player)
  - current_player is the player to move at this node; root_player is the evaluation perspective.
  - Respects move types and stamina to decide depth progression. */
 static int minimax_search(const game_state &gs, int depth, char current_player, char root_player, int H, int W,
-                          const std::vector<item> &items, int &alpha, int &beta)
+                          const std::vector<item> &items, int &alpha, int &beta, int consecutivePasses, int &maxpasses)
 {
+    if(consecutivePasses >= maxpasses){
+        return close_game_eval(gs, root_player);
+    }
+
     if (depth == 0 || game_over_check(gs))
         return static_eval(gs, root_player);
 
@@ -746,12 +782,17 @@ static int minimax_search(const game_state &gs, int depth, char current_player, 
         {
             char next_player = current_player;
 
-            if (moves[i].type == 'p')
+            if (moves[i].type == 'p'){
                 next_player = (current_player == 'A') ? 'B' : 'A';
+                consecutivePasses++;
+            }
+            else{
+                consecutivePasses = 0;
+            }
 
             int next_depth = (moves[i].type == 'p') ? depth - 1 : depth;
 
-            int eval = minimax_search(ngs[i], next_depth, next_player, root_player, H, W, items, alpha, beta);
+            int eval = minimax_search(ngs[i], next_depth, next_player, root_player, H, W, items, alpha, beta, consecutivePasses, maxpasses);
 
             max_eval = std::max(max_eval, eval);
             alpha = std::max(alpha, eval);
@@ -770,12 +811,17 @@ static int minimax_search(const game_state &gs, int depth, char current_player, 
         {
             char next_player = current_player;
 
-            if (moves[i].type == 'p')
+            if (moves[i].type == 'p'){
                 next_player = (current_player == 'A') ? 'B' : 'A';
+                consecutivePasses++;
+            }
+            else{
+                consecutivePasses = 0;
+            }
 
             int next_depth = (moves[i].type == 'p') ? depth - 1 : depth;
 
-            int eval = minimax_search(ngs[i], next_depth, next_player, root_player, H, W, items, alpha, beta);
+            int eval = minimax_search(ngs[i], next_depth, next_player, root_player, H, W, items, alpha, beta, consecutivePasses, maxpasses);
 
             min_eval = std::min(min_eval, eval);
             beta = std::min(beta, eval);
@@ -788,24 +834,43 @@ static int minimax_search(const game_state &gs, int depth, char current_player, 
     }
 }
 
+EngineResult best_move(const char* file_name)
+{
+    std::ifstream fin(file_name);
+    if (!fin.is_open())
+    {
+        Move m;
+        m.type = 'p';
+        m.torow = '.';
+        m.tocol = 0;
+        return {m, -INF, 0};
+    }
+
+    return best_move_from_stream(fin);
+}
+
+double score_to_chance(int score) // sigmoid function
+{
+    const double K = 200.0;   // scaling factor
+
+    if(score >= INF) return 1.0;
+    if(score <= -INF) return 0.0;
+
+    return 1.0 / (1.0 + std::exp(-score / K));
+}
+
 /* best_move
  - Parse input file, run next_states + minimax, return best Move.
  - current_player is the player that must act now. */
-Move best_move(const char *file_name)
+EngineResult best_move_from_stream(std::istream& fin)
 {
-    Move nullm;
-    nullm.type = 'p';
-    nullm.torow = '.';
-    nullm.tocol = 0;
-    std::ifstream fin(file_name);
-    if (!fin.is_open())
-        return nullm;
+    EngineResult nullRes = {{'p', '.', 0}, -INF, 0};
 
-    int H, W;
+    int H, W, depth;
     char current_player;
-    fin >> H >> W >> current_player;
+    fin >> H >> W >> current_player >> depth;
     if (!fin)
-        return nullm;
+        return nullRes;
 
     game_state gs;
     fin >> gs.players[0].H >> gs.players[0].A >> gs.players[0].D >> gs.players[0].s >> gs.players[0].S;
@@ -813,33 +878,44 @@ Move best_move(const char *file_name)
 
     int n;
     fin >> n;
-    std::vector<item> items;
-    items.resize(std::max(0, n));
+    std::vector<item> items(n);
     for (int i = 0; i < n; ++i)
     {
         fin >> items[i].dH >> items[i].dA >> items[i].dD >> items[i].dS;
     }
+
     std::string rest;
     std::getline(fin, rest); // eat endline
     std::getline(fin, gs.s);
+
     if (!gs.s.empty() && gs.s.back() == '\r')
         gs.s.pop_back();
 
     std::vector<game_state> ngs;
     std::vector<Move> moves;
+
     int nStates = next_states(H, W, gs, current_player, items, ngs, moves);
     if (nStates <= 0)
-        return nullm;
+        return nullRes;
 
     int best_index = 0;
     int best_score = -INF;
-    int alpha = -INF, beta = INF;
-    int depth = 30; // realistic maximum depth
+
     for (int i = 0; i < nStates; ++i)
     {
-        bool is_max = (moves[i].type == 'p') ? false : true;
-        int a = alpha, b = beta;
-        int score = minimax_search(ngs[i], depth, current_player, current_player, H, W, items, a, b);
+        int alpha = -INF, beta = INF, consecutivePasses = 0, maxpasses = std::min(depth, 10);
+        int score = minimax_search(
+            ngs[i],
+            depth,
+            current_player,
+            current_player,
+            H, W,
+            items,
+            alpha, beta,
+            consecutivePasses,
+            maxpasses
+        );
+
         if (score > best_score)
         {
             best_score = score;
@@ -847,5 +923,5 @@ Move best_move(const char *file_name)
         }
     }
 
-    return moves[best_index];
+    return {moves[best_index], best_score, score_to_chance(best_score)};
 }
